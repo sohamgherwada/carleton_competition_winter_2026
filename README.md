@@ -1,8 +1,6 @@
 # SQL Query Writer Agent Competition
 
-## Organized by MindBridge AI
-
-Welcome to the SQL Query Writer Agent Competition! This competition challenges you to build an intelligent agent that can translate natural language questions into SQL queries for a relational database.
+Welcome to the SQL Query Writer Agent Competition Organized by MindBridge AI! This competition challenges you to build an intelligent agent that can translate natural language questions into SQL queries for a relational database.
 
 ---
 
@@ -612,3 +610,5 @@ Good luck and happy coding!
 ---
 
 *Organized by MindBridge AI*
+
+This competition is for educational purposes only and is non-commercial in nature.
