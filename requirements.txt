@@ -14,3 +14,7 @@ ollama==0.4.7
 # Add your agent dependencies below (examples commented out)
 # langchain==0.3.7
 # langchain-ollama==0.2.3
+# Additional RAG dependencies
+lancedb
+beautifulsoup4
+requests

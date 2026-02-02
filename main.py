@@ -102,6 +102,14 @@ def main():
             if len(results) > 10:
                 print(f"... and {len(results) - 10} more rows")
 
+            # Learning Loop
+            feedback = input("\nWas this result correct? (y/n): ").strip().lower()
+            if feedback == 'y':
+                 agent.learn(user_query, sql)
+                 print("Thanks! I've learned this query for next time.")
+            else:
+                 print("Okay, I won't memorize this one.")
+
         except NotImplementedError as e:
             print(f"\nError: {e}")
             print("Please implement the generate_query method in agent.py!")

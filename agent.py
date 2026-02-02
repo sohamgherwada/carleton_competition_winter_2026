@@ -6,28 +6,24 @@ Implement your agent logic in this file.
 """
 
 import os
+import duckdb
 from db.bike_store import get_schema_info
-
+from ollama import Client
+try:
+    from src.knowledge_base import KnowledgeBase
+except ImportError:
+    # Handle case where dependencies might not be fully set up yet during initial loads
+    KnowledgeBase = None
 
 def get_ollama_client():
-    """
-    Get Ollama client configured for either Carleton server or local instance.
-
-    Set OLLAMA_HOST environment variable to use Carleton's LLM server.
-    Defaults to local Ollama instance.
-    """
-    import ollama
-    host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-    return ollama.Client(host=host)
-
+    from ollama import Client
+    return Client(host="http://localhost:11434", timeout=1200.0)
 
 def get_model_name():
-    """
-    Get the model name from environment or use default.
+    return "deepseek-coder:6.7b-base-q4_K_M"
 
-    Set OLLAMA_MODEL environment variable to specify which model to use.
-    """
-    return os.getenv('OLLAMA_MODEL', 'llama3.2')
+ 
+
 
 
 class QueryWriter:
@@ -49,60 +45,144 @@ class QueryWriter:
         self.schema = get_schema_info(db_path=db_path)
         self.client = get_ollama_client()
         self.model = get_model_name()
-
-        # TODO: Add any additional initialization here
-        # For example:
-        # - Set up prompt templates
-        # - Initialize any additional components (e.g., LangChain agents)
-        # - Load any additional resources
+        
+        # Initialize Knowledge Base
+        try:
+            self.kb = KnowledgeBase() if KnowledgeBase else None
+            # Optional: Ingest docs on first run if empty
+            # self.kb.ingest_docs() 
+        except Exception as e:
+            print(f"Warning: Could not initialize Knowledge Base: {e}")
+            self.kb = None
 
     def generate_query(self, prompt: str) -> str:
         """
         Generate a SQL query from a natural language prompt.
-
-        This method is called by the evaluation system. It must:
-        1. Accept a natural language question as input
-        2. Return a valid SQL query string
-
-        Args:
-            prompt (str): The natural language question from the user.
-                         Example: "What are the top 5 most expensive products?"
-
-        Returns:
-            str: A valid SQL query that answers the question.
-                 Example: "SELECT product_name, list_price FROM products ORDER BY list_price DESC LIMIT 5"
-
-        Note:
-            - The query will be executed against the bike store DuckDB database
-            - Return ONLY the SQL query, no explanations or markdown formatting
-            - Handle edge cases gracefully (return a reasonable query or raise an exception)
+        Includes RAG retrieval and Auto-Retry on syntax errors.
         """
-        # ============================================================
-        # YOUR IMPLEMENTATION HERE
-        # ============================================================
-        #
-        # Example implementation using Ollama directly:
-        #
-        # schema_text = self._format_schema()
-        #
-        # system_prompt = f"""You are a SQL expert. Given the following database schema:
-        # {schema_text}
-        #
-        # Generate a SQL query to answer the user's question.
-        # Return ONLY the SQL query, no explanations."""
-        #
-        # response = self.client.chat(
-        #     model=self.model,
-        #     messages=[
-        #         {'role': 'system', 'content': system_prompt},
-        #         {'role': 'user', 'content': prompt}
-        #     ]
-        # )
-        # return response['message']['content'].strip()
-        #
-        # ============================================================
+        # 1. Retrieve Context from RAG
+        rag_context = ""
+        if self.kb:
+            try:
+                results = self.kb.search(prompt)
+                
+                if results.get("learned"):
+                    rag_context += "\nPossibly Relevant Past Queries:\n"
+                    for item in results["learned"]:
+                        rag_context += f"- Q: {item['prompt']}\n  SQL: {item['sql']}\n"
+                
+                if results.get("docs"):
+                     rag_context += "\nSyntax Reference:\n"
+                     for item in results["docs"]:
+                         rag_context += f"- {item['text']}\n"
+            except Exception as e:
+                print(f"RAG search failed: {e}")
 
-        raise NotImplementedError("Implement the generate_query method!")
+        # 2. Format Schema
+        schema_text = self._format_schema()
+
+        # 3. Execution Loop with Retry
+        max_retries = 3
+        current_attempt = 0
+        error_history = ""
+        
+        last_generated_sql = ""
+
+        previous_sql_signatures = set()
+        
+        while current_attempt < max_retries:
+            # Base Model Prompting: Comments + SQL Context
+            # We avoid "You are an expert" chat instructions which confuse base models.
+            full_prompt = f"""/* Database Schema */
+{schema_text}
+
+/* Relevant Examples */
+{rag_context}
+
+/* User Question: {prompt} */
+/* Previous Errors to fix: {error_history} */
+
+/* CRITICAL RULES:
+   1. ALWAYS use table aliases (e.g. p.list_price, oi.list_price) to prevent "Ambiguous column" errors.
+   2. Use explicit JOINs.
+*/
+
+-- Generate the valid DuckDB SQL query for the question:
+SELECT"""
+            
+            # Note for later: We might need to handle the response not starting with SELECT if we don't complete it.
+            # But let's try standard chat first. Deepseek Base often just completes code.
+
+
+            # Call LLM
+            try:
+                # Decide model - user asked to use Deepseek for fixing? 
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[
+                        {'role': 'user', 'content': full_prompt}
+                    ]
+                )
+                sql = response['message']['content']
+                
+                # If the model completes " * FROM...", we need to add "SELECT" back
+                if not sql.strip().upper().startswith("SELECT") and not sql.strip().upper().startswith("WITH"):
+                     sql = "SELECT " + sql
+                # Robust cleanup using regex
+                import re
+                # Find content between ```sql and ``` or just ``` and ```
+                match = re.search(r'```(?:sql)?\s*(.*?)\s*```', sql, re.DOTALL | re.IGNORECASE)
+                if match:
+                    sql = match.group(1)
+                else:
+                    # If no code blocks, assume the whole response is SQL but strip generic chat text if possible
+                    # Or just strip whitespace
+                    sql = sql.strip()
+                    # Remove common prefixes if they exist (hacky but useful for chat models)
+                    sql = re.sub(r'^(Here is the SQL|Sure|The query is|Based on the schema).*?:', '', sql, flags=re.IGNORECASE | re.DOTALL).strip()
+
+                last_generated_sql = sql
+                
+                # Dry Run Validation
+                error_msg = self._validate_sql(sql)
+                if error_msg is None:
+                    return sql
+                else:
+                    print(f"Attempt {current_attempt+1} failed: {error_msg}")
+                    # Construct a stronger error prompt
+                    error_history += f"\nAttempt {current_attempt+1} SQL:\n{sql}\nError: {error_msg}\n"
+                    # Add explicit instruction to change approach
+                    previous_sql_signatures.add(sql)
+
+            except Exception as e:
+                print(f"LLM generation failed: {e}")
+                
+            current_attempt += 1
+        
+        # If all retries failed, return the last generated SQL (best effort)
+        return last_generated_sql
+
+    def _validate_sql(self, sql: str) -> str | None:
+        """
+        Tries to Prepare/Explain the query to check for syntax errors.
+        Returns None if valid, or the error message string if invalid.
+        """
+        con = duckdb.connect(self.db_path, read_only=True)
+        try:
+            # Use EXPLAIN to check validity without running expensive queries
+            con.execute(f"EXPLAIN {sql}")
+            return None
+        except Exception as e:
+            return str(e)
+        finally:
+            con.close()
+
+    def learn(self, prompt: str, sql: str):
+        """
+        Save a successful query to the Knowledge Base.
+        """
+        if self.kb:
+            self.kb.add_learned_query(prompt, sql)
 
     def _format_schema(self) -> str:
         """
@@ -116,3 +196,21 @@ class QueryWriter:
             cols = ", ".join([f"{col['name']} ({col['type']})" for col in columns])
             schema_parts.append(f"Table {table_name}: {cols}")
         return "\n".join(schema_parts)
+
+
+if __name__ == "__main__":
+    # Test code to verify connection
+    print("Testing Ollama connection...")
+    try:
+        client = get_ollama_client()
+        model = get_model_name()
+        print(f"Connecting to {client._client.base_url} with model {model}...")
+        
+        response = client.chat(
+            model=model,
+            messages=[{'role': 'user', 'content': 'Hello, are you working?'}]
+        )
+        print("\nSuccess! Response from LLM:")
+        print(response['message']['content'])
+    except Exception as e:
+        print(f"\nConnection failed: {e}")
